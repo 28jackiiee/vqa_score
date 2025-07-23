@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datasets import load_dataset, Dataset
 
-def get_video_url_from_hf(video_item: Any, dataset_name: str = "", file_index: int = 0) -> str:
+def get_video_url_from_hf(video_item: Any, dataset_name: str = "", file_index: int = 0, data_dir: Optional[str] = None) -> str:
     """
     Extract the original Hugging Face URL from video data.
     
@@ -19,6 +19,7 @@ def get_video_url_from_hf(video_item: Any, dataset_name: str = "", file_index: i
         video_item: Video data from the dataset (could be string URL, path, or video object)
         dataset_name: Name of the HF dataset for constructing URLs
         file_index: Index for constructing URLs if needed
+        data_dir: Data directory path within the dataset (optional)
         
     Returns:
         Original URL or path to the video file
@@ -127,8 +128,11 @@ def get_video_url_from_hf(video_item: Any, dataset_name: str = "", file_index: i
     if filename and dataset_name and filename != 'None' and '<none>' not in str(filename).lower():
         # Clean dataset name for URL
         dataset_clean = dataset_name.replace('/', '--')
-        # Construct Hugging Face URL
-        hf_url = f"https://huggingface.co/datasets/{dataset_name}/resolve/main/{filename}"
+        # Construct Hugging Face URL with data_dir if provided
+        if data_dir:
+            hf_url = f"https://huggingface.co/datasets/{dataset_name}/resolve/main/{data_dir}/{filename}"
+        else:
+            hf_url = f"https://huggingface.co/datasets/{dataset_name}/resolve/main/{filename}"
         return hf_url
     
     # Fallback to filename or original item
@@ -141,7 +145,8 @@ def extract_videos_from_dataset(dataset: Dataset,
                                split: str = "train",
                                max_items: Optional[int] = None,
                                default_label: str = "default_label",
-                               change_label: Optional[str] = None) -> List[Dict[str, str]]:
+                               change_label: Optional[str] = None,
+                               data_dir: Optional[str] = None) -> List[Dict[str, str]]:
     """
     Extract video URLs and labels from a Hugging Face dataset.
     
@@ -154,6 +159,7 @@ def extract_videos_from_dataset(dataset: Dataset,
         max_items: Maximum number of items to process (for streaming datasets)
         default_label: Default label to use when no label column is specified
         change_label: Override label to apply to all videos (optional)
+        data_dir: Data directory path within the dataset (optional)
         
     Returns:
         List of dictionaries with video and label keys
@@ -200,7 +206,7 @@ def extract_videos_from_dataset(dataset: Dataset,
                 
             # Extract video
             video_data = item[video_column]
-            video_url = get_video_url_from_hf(video_data, dataset_name, i)
+            video_url = get_video_url_from_hf(video_data, dataset_name, i, data_dir)
             
             # Extract label
             if use_label:
@@ -228,6 +234,8 @@ def extract_videos_from_dataset(dataset: Dataset,
 def main():
     parser = argparse.ArgumentParser(description="Convert Hugging Face dataset to JSON input file")
     parser.add_argument("-database", "--database", required=False, help="Hugging Face dataset name or path")
+    parser.add_argument("-data-dir", "--data-dir", default=None, 
+                       help="Directory name to filter from jackieyayqli/vqascore dataset")
     parser.add_argument("-o", "--output", default="input.json", help="Output JSON file (default: input.json)")
     parser.add_argument("-label", "--label", default="cam_motion.dolly_zoom_movement.has_dolly_in_zoom_out", 
                        help="Default label if no label column specified")
@@ -270,20 +278,26 @@ def main():
             print(f"JSON file updated: {args.output}")
             return 0
         
-        # If no change_label or no existing file, require database
-        if not args.database:
-            print("Error: --database is required when not using --change_label on existing file")
-            return 1
+        # Handle data-dir option
+        if args.data_dir:
+            dataset_name = "jackieyayqli/vqascore"
+            print(f"Loading dataset: {dataset_name} with data-dir filter: {args.data_dir}")
+        else:
+            # If no change_label or no existing file, require database
+            if not args.database:
+                print("Error: --database is required when not using --change_label on existing file or --data-dir")
+                return 1
+            dataset_name = args.database
+            print(f"Loading dataset: {dataset_name}")
         
-        # Load dataset with streaming to avoid automatic downloads
-        print(f"Loading dataset: {args.database}")
         if args.subset:
             print(f"Using subset: {args.subset}")
         
         # Force streaming mode to get URLs instead of downloaded files
         dataset = load_dataset(
-            args.database, 
+            dataset_name, 
             name=args.subset,
+            data_dir=args.data_dir if args.data_dir else None,
             streaming=True  # Force streaming to avoid downloads
         )
         
@@ -294,13 +308,14 @@ def main():
         # Extract videos with original URLs
         json_data = extract_videos_from_dataset(
             dataset=dataset,
-            dataset_name=args.database,
+            dataset_name=dataset_name,
             video_column=args.video_column,
             label_column=args.label_column,
             split=args.split,
             max_items=args.max_items,
             default_label=args.label,
-            change_label=args.change_label
+            change_label=args.change_label,
+            data_dir=args.data_dir
         )
         
         if not json_data:
