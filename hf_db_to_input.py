@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-Script to convert a Hugging Face dataset into a JSON input file.
-Takes a dataset name/path and generates a JSON file with video paths and labels.
+Convert a Hugging Face dataset into an input.json of:
+[
+  {"video": "<url>", "label": "<label>"},
+  ...
+]
+
+Key flags:
+  -database      HF dataset path (e.g. jackieyayqli/vqascore)
+  -data-dir      Subdirectory to load/filter from inside the repo (passed to load_dataset)
+  -directory     Subdirectory to prepend in constructed URLs (if different from --data-dir)
+  -label         Default label used when no label column is present
+  --change_label Overwrite all labels in an existing JSON (and exit)
 """
 
 import os
@@ -11,344 +21,271 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datasets import load_dataset, Dataset
 
-def get_video_url_from_hf(video_item: Any, dataset_name: str = "", file_index: int = 0, data_dir: Optional[str] = None) -> str:
+def get_video_url_from_hf(
+    video_item: Any,
+    dataset_name: str = "",
+    file_index: int = 0,
+    data_dir: Optional[str] = None,
+    directory: Optional[str] = None
+) -> str:
     """
-    Extract the original Hugging Face URL from video data.
-    
-    Args:
-        video_item: Video data from the dataset (could be string URL, path, or video object)
-        dataset_name: Name of the HF dataset for constructing URLs
-        file_index: Index for constructing URLs if needed
-        data_dir: Data directory path within the dataset (optional)
-        
-    Returns:
-        Original URL or path to the video file
+    Try to recover or build the original HF URL for a video.
+
+    If the item already contains an http(s) URL, return it.
+    Otherwise, build: https://huggingface.co/datasets/{dataset_name}/resolve/main/{subdir}/{filename}
+    where subdir = --directory if provided, else --data-dir if provided.
     """
-    # If it's already a URL string, return it
-    if isinstance(video_item, str) and video_item.startswith(('http://', 'https://')):
+    # Quick exit: plain URL string
+    if isinstance(video_item, str) and video_item.startswith(("http://", "https://")):
         return video_item
-    
-    # Try to extract filename from various video object types
+
     filename = None
-    
-    # Handle VideoReader objects from torchvision/HF datasets
-    if hasattr(video_item, '_hf_encoded') and isinstance(video_item._hf_encoded, dict):
-        # Extract from _hf_encoded path
-        hf_path = video_item._hf_encoded.get('path', '')
-        if hf_path.startswith('hf://'):
-            # Convert hf:// URL to https:// URL
-            # Format: hf://datasets/username/dataset@hash/filename.mp4
-            # Convert to: https://huggingface.co/datasets/username/dataset/resolve/main/filename.mp4
-            path_parts = hf_path.replace('hf://', '').split('/')
-            if len(path_parts) >= 3:
-                # Extract dataset path and filename
-                dataset_path = '/'.join(path_parts[1:-1])  # Skip 'datasets' and filename
-                filename = path_parts[-1]  # Get filename
-                
-                # Remove the @hash part if present
-                if '@' in dataset_path:
-                    dataset_path = dataset_path.split('@')[0]
-                
+
+    # HF Video object with _hf_encoded dict
+    if hasattr(video_item, "_hf_encoded") and isinstance(video_item._hf_encoded, dict):
+        hf_path = video_item._hf_encoded.get("path", "")
+        if hf_path.startswith("hf://"):
+            # hf://datasets/user/dset@hash/filename.mp4
+            parts = hf_path.replace("hf://", "").split("/")
+            if len(parts) >= 3:
+                dataset_path = "/".join(parts[1:-1])  # skip 'datasets' + filename
+                filename = parts[-1]
+                if "@" in dataset_path:
+                    dataset_path = dataset_path.split("@")[0]
+                subdir = directory or data_dir
+                if subdir:
+                    return f"https://huggingface.co/datasets/{dataset_path}/resolve/main/{subdir}/{filename}"
                 return f"https://huggingface.co/datasets/{dataset_path}/resolve/main/{filename}"
         elif hf_path:
-            # Extract filename from path
             filename = os.path.basename(hf_path)
-    
-    # Handle VideoReader objects with container
-    elif hasattr(video_item, 'container') and hasattr(video_item, '_hf_encoded'):
-        # This is a VideoReader object from HF datasets
-        if hasattr(video_item.container, 'name'):
-            path = video_item.container.name
-            filename = os.path.basename(path)
-        elif hasattr(video_item, '_c') and hasattr(video_item._c, 'file') and hasattr(video_item._c.file, 'name'):
-            path = video_item._c.file.name
-            filename = os.path.basename(path)
-        else:
-            # Try to get the source path from the container
-            try:
-                container = video_item.container
-                if hasattr(container, 'name'):
-                    filename = os.path.basename(container.name)
-                elif hasattr(container, 'metadata'):
-                    metadata = container.metadata
-                    if 'filename' in metadata:
-                        filename = metadata['filename']
-                elif hasattr(container, 'file'):
-                    if hasattr(container.file, 'name'):
-                        filename = os.path.basename(container.file.name)
-                    else:
-                        filename = str(container.file)
-            except Exception as e:
-                print(f"Warning: Could not extract filename from VideoReader: {e}")
-                filename = f"video_{file_index}.mp4"
-    
-    # Try other common video object attributes
-    elif hasattr(video_item, 'path'):
+
+    # TorchVision / PyAV style
+    elif hasattr(video_item, "container") and hasattr(video_item, "_hf_encoded"):
+        try:
+            if hasattr(video_item.container, "name"):
+                filename = os.path.basename(video_item.container.name)
+            elif hasattr(video_item._c, "file") and hasattr(video_item._c.file, "name"):
+                filename = os.path.basename(video_item._c.file.name)
+        except Exception:
+            filename = f"video_{file_index}.mp4"
+
+    # Common attributes
+    elif hasattr(video_item, "path"):
         filename = os.path.basename(video_item.path)
-    elif hasattr(video_item, 'filename'):
+    elif hasattr(video_item, "filename"):
         filename = video_item.filename
-    elif hasattr(video_item, 'name'):
+    elif hasattr(video_item, "name"):
         filename = video_item.name
-    elif hasattr(video_item, 'url'):
-        # If there's a URL attribute, return it directly
-        return video_item.url
-    elif hasattr(video_item, 'src'):
-        # Check for src attribute
-        if isinstance(video_item.src, str) and video_item.src.startswith(('http://', 'https://')):
+    elif hasattr(video_item, "url"):
+        if isinstance(video_item.url, str) and video_item.url.startswith(("http://", "https://")):
+            return video_item.url
+        filename = os.path.basename(str(video_item.url))
+    elif hasattr(video_item, "src"):
+        if isinstance(video_item.src, str) and video_item.src.startswith(("http://", "https://")):
             return video_item.src
-        else:
-            filename = os.path.basename(str(video_item.src))
+        filename = os.path.basename(str(video_item.src))
     elif isinstance(video_item, str):
-        if video_item.startswith('/'):
-            # It's a local path, extract filename
+        if video_item.startswith("/"):
             filename = os.path.basename(video_item)
         else:
-            # Assume it's already a filename or URL
             filename = video_item
     elif isinstance(video_item, dict):
-        # Handle dictionary-like video objects
-        for key in ['url', 'src', 'path', 'filename', 'name']:
+        for key in ["url", "src", "path", "filename", "name"]:
             if key in video_item:
-                value = video_item[key]
-                if isinstance(value, str):
-                    if value.startswith(('http://', 'https://')):
-                        return value
-                    else:
-                        filename = os.path.basename(value)
-                        break
+                val = video_item[key]
+                if isinstance(val, str) and val.startswith(("http://", "https://")):
+                    return val
+                filename = os.path.basename(str(val))
+                break
     else:
-        # Try to convert to string and extract filename
-        str_item = str(video_item)
-        if '/' in str_item:
-            filename = os.path.basename(str_item)
-        else:
-            filename = str_item
-    
-    # If we have a dataset name and filename, construct HF URL
-    if filename and dataset_name and filename != 'None' and '<none>' not in str(filename).lower():
-        # Clean dataset name for URL
-        dataset_clean = dataset_name.replace('/', '--')
-        # Construct Hugging Face URL with data_dir if provided
-        if data_dir:
-            hf_url = f"https://huggingface.co/datasets/{dataset_name}/resolve/main/{data_dir}/{filename}"
-        else:
-            hf_url = f"https://huggingface.co/datasets/{dataset_name}/resolve/main/{filename}"
-        return hf_url
-    
-    # Fallback to filename or original item
+        s = str(video_item)
+        filename = os.path.basename(s) if "/" in s else s
+
+    # Build HF URL
+    if filename and dataset_name and filename != "None" and "<none>" not in str(filename).lower():
+        subdir = directory or data_dir
+        if subdir:
+            return f"https://huggingface.co/datasets/{dataset_name}/resolve/main/{subdir}/{filename}"
+        return f"https://huggingface.co/datasets/{dataset_name}/resolve/main/{filename}"
+
     return filename if filename else f"video_{file_index}.mp4"
 
-def extract_videos_from_dataset(dataset: Dataset, 
-                               dataset_name: str = "",
-                               video_column: str = "video",
-                               label_column: Optional[str] = None,
-                               split: str = "train",
-                               max_items: Optional[int] = None,
-                               default_label: str = "default_label",
-                               change_label: Optional[str] = None,
-                               data_dir: Optional[str] = None) -> List[Dict[str, str]]:
+
+def extract_videos_from_dataset(
+    dataset: Dataset,
+    dataset_name: str = "",
+    video_column: str = "video",
+    label_column: Optional[str] = None,
+    split: str = "train",
+    max_items: Optional[int] = None,
+    default_label: str = "default_label",
+    change_label: Optional[str] = None,
+    data_dir: Optional[str] = None,
+    directory: Optional[str] = None
+) -> List[Dict[str, str]]:
     """
-    Extract video URLs and labels from a Hugging Face dataset.
-    
-    Args:
-        dataset: Loaded HF dataset
-        dataset_name: Name of the HF dataset for URL construction
-        video_column: Name of the column containing video data
-        label_column: Name of the column containing labels (optional)
-        split: Dataset split to use
-        max_items: Maximum number of items to process (for streaming datasets)
-        default_label: Default label to use when no label column is specified
-        change_label: Override label to apply to all videos (optional)
-        data_dir: Data directory path within the dataset (optional)
-        
-    Returns:
-        List of dictionaries with video and label keys
+    Iterate through the dataset split and build the list of {video, label}.
     """
-    results = []
-    
-    # Get the specified split
+    results: List[Dict[str, str]] = []
+
+    # Grab the split
     if isinstance(dataset, dict):
         if split not in dataset:
-            available_splits = list(dataset.keys())
-            raise ValueError(f"Split '{split}' not found. Available splits: {available_splits}")
+            raise ValueError(f"Split '{split}' not found. Available splits: {list(dataset.keys())}")
         data = dataset[split]
     else:
         data = dataset
-    
-    # Check if required columns exist (for non-streaming datasets)
-    if hasattr(data, 'column_names'):
+
+    # Column sanity checks for non-streaming
+    if hasattr(data, "column_names"):
         if video_column not in data.column_names:
-            raise ValueError(f"Video column '{video_column}' not found. Available columns: {data.column_names}")
-        
+            raise ValueError(f"Video column '{video_column}' not found. Columns: {data.column_names}")
         if label_column and label_column not in data.column_names:
-            print(f"Warning: Label column '{label_column}' not found. Available columns: {data.column_names}")
+            print(f"Warning: label column '{label_column}' not in columns. Ignoring.")
             label_column = None
-    
-    # Handle streaming vs non-streaming datasets
-    if hasattr(data, '__len__'):
-        print(f"Processing {len(data)} items from dataset...")
+
+    if hasattr(data, "__len__"):
+        print(f"Processing {len(data)} items...")
     else:
         print("Processing streaming dataset...")
-    
-    # Determine which label to use
-    if change_label:
-        print(f"Using override label for all videos: {change_label}")
-        use_label = change_label
-    else:
-        use_label = None  # Will be determined per item
-    
+
+    override_label = change_label if change_label else None
+
     for i, item in enumerate(data):
+        if max_items and i >= max_items:
+            print(f"Reached max-items={max_items}")
+            break
+
         try:
-            # Check if we've reached max items limit
-            if max_items and i >= max_items:
-                print(f"Reached maximum items limit: {max_items}")
-                break
-                
-            # Extract video
             video_data = item[video_column]
-            video_url = get_video_url_from_hf(video_data, dataset_name, i, data_dir)
-            
-            # Extract label
-            if use_label:
-                # Use the override label
-                label = use_label
+            video_url = get_video_url_from_hf(
+                video_item=video_data,
+                dataset_name=dataset_name,
+                file_index=i,
+                data_dir=data_dir,
+                directory=directory
+            )
+
+            if override_label:
+                label = override_label
             elif label_column and label_column in item:
                 label = str(item[label_column])
             else:
                 label = default_label
-            
-            results.append({
-                "video": video_url,
-                "label": label
-            })
-            
+
+            results.append({"video": video_url, "label": label})
+
             if (i + 1) % 10 == 0:
                 print(f"Processed {i + 1} items...")
-                
+
         except Exception as e:
-            print(f"Error processing item {i}: {e}")
+            print(f"Error on item {i}: {e}")
             continue
-    
+
     return results
 
-def main():
-    parser = argparse.ArgumentParser(description="Convert Hugging Face dataset to JSON input file")
-    parser.add_argument("-database", "--database", required=False, help="Hugging Face dataset name or path")
-    parser.add_argument("-data-dir", "--data-dir", default=None, 
-                       help="Directory name to filter from jackieyayqli/vqascore dataset")
-    parser.add_argument("-o", "--output", default="input.json", help="Output JSON file (default: input.json)")
-    parser.add_argument("-label", "--label", default="cam_motion.dolly_zoom_movement.has_dolly_in_zoom_out", 
-                       help="Default label if no label column specified")
-    parser.add_argument("--change_label", default=None, 
-                       help="Override label to apply to all videos (ignores dataset labels)")
-    parser.add_argument("--video-column", default="video", 
-                       help="Name of the video column in the dataset (default: video)")
-    parser.add_argument("--label-column", default=None, 
-                       help="Name of the label column in the dataset (optional)")
-    parser.add_argument("--split", default="train", 
-                       help="Dataset split to use (default: train)")
-    parser.add_argument("--subset", default=None, 
-                       help="Dataset subset/config name (optional)")
-    parser.add_argument("--streaming", action="store_true", 
-                       help="Use streaming mode for large datasets")
-    parser.add_argument("--max-items", type=int, default=None, 
-                       help="Maximum number of items to process (optional)")
-    
+
+def change_labels_in_file(path: str, new_label: str) -> int:
+    with open(path, "r") as f:
+        data = json.load(f)
+    count = 0
+    for item in data:
+        if isinstance(item, dict) and "label" in item:
+            item["label"] = new_label
+            count += 1
+    with open(path, "w") as f:
+        json.dump(data, f, indent=4)
+    return count
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Convert HF dataset to input.json")
+    parser.add_argument("-database", "--database", help="HF dataset path (e.g. user/dset)")
+    parser.add_argument("-data-dir", "--data-dir", default=None,
+                        help="Directory in the repo to *load* from (passed to load_dataset)")
+    parser.add_argument("-directory", "--directory", default=None,
+                        help="Directory to prepend in constructed URLs (if you want a different one)")
+    parser.add_argument("-o", "--output", default="input.json", help="Output JSON file")
+    parser.add_argument("-label", "--label",
+                        default="cam_motion.dolly_zoom_movement.has_dolly_in_zoom_out",
+                        help="Default label if none provided")
+    parser.add_argument("--change_label", default=None,
+                        help="Overwrite labels in existing JSON and exit")
+    parser.add_argument("--video-column", default="video",
+                        help="Column name for video objects/paths")
+    parser.add_argument("--label-column", default=None,
+                        help="Column name for labels in the dataset")
+    parser.add_argument("--split", default="train", help="Split to read (default: train)")
+    parser.add_argument("--subset", default=None, help="Subset/config name (optional)")
+    parser.add_argument("--streaming", action="store_true", help="Force streaming mode")
+    parser.add_argument("--max-items", type=int, default=None, help="Limit items (debugging)")
     args = parser.parse_args()
-    
-    try:
-        # Check if --change_label is provided and input.json exists
-        if args.change_label and os.path.exists(args.output):
-            print(f"Found existing {args.output}, changing labels to: {args.change_label}")
-            
-            # Load existing JSON file
-            with open(args.output, 'r') as f:
-                json_data = json.load(f)
-            
-            # Update all labels
-            for item in json_data:
-                if isinstance(item, dict) and 'label' in item:
-                    item['label'] = args.change_label
-            
-            # Write back to file
-            with open(args.output, 'w') as f:
-                json.dump(json_data, f, indent=4)
-            
-            print(f"Updated {len(json_data)} entries with new label: {args.change_label}")
-            print(f"JSON file updated: {args.output}")
-            return 0
-        
-        # Handle data-dir option
-        if args.data_dir:
-            dataset_name = "jackieyayqli/vqascore"
-            print(f"Loading dataset: {dataset_name} with data-dir filter: {args.data_dir}")
-        else:
-            # If no change_label or no existing file, require database
-            if not args.database:
-                print("Error: --database is required when not using --change_label on existing file or --data-dir")
-                return 1
-            dataset_name = args.database
-            print(f"Loading dataset: {dataset_name}")
-        
-        if args.subset:
-            print(f"Using subset: {args.subset}")
-        
-        # Force streaming mode to get URLs instead of downloaded files
-        dataset = load_dataset(
-            dataset_name, 
-            name=args.subset,
-            data_dir=args.data_dir if args.data_dir else None,
-            streaming=True  # Force streaming to avoid downloads
-        )
-        
-        print(f"Dataset loaded successfully!")
-        if isinstance(dataset, dict):
-            print(f"Available splits: {list(dataset.keys())}")
-        
-        # Extract videos with original URLs
-        json_data = extract_videos_from_dataset(
-            dataset=dataset,
-            dataset_name=dataset_name,
-            video_column=args.video_column,
-            label_column=args.label_column,
-            split=args.split,
-            max_items=args.max_items,
-            default_label=args.label,
-            change_label=args.change_label,
-            data_dir=args.data_dir
-        )
-        
-        if not json_data:
-            print("No video data extracted from dataset")
-            return 1
-        
-        print(f"\nExtracted {len(json_data)} video entries")
-        
-        # Show some examples
-        print("\nFirst few entries:")
-        for i, entry in enumerate(json_data[:3]):
-            print(f"  {i+1}. Video: {entry['video']}")
-            print(f"     Label: {entry['label']}")
-        
-        # Write to output file
-        with open(args.output, 'w') as f:
-            json.dump(json_data, f, indent=4)
-        
-        print(f"\nJSON file created: {args.output}")
-        print(f"Contains {len(json_data)} video entries")
-        
-        # Show label distribution
-        labels = [item['label'] for item in json_data]
-        unique_labels = set(labels)
-        if len(unique_labels) > 1:
-            print(f"\nLabel distribution:")
-            for label in sorted(unique_labels):
-                count = labels.count(label)
-                print(f"  {label}: {count} videos")
-        
-    except Exception as e:
-        print(f"Error: {e}")
+
+    # Fast path: just change labels
+    if args.change_label and os.path.exists(args.output):
+        print(f"Changing labels in {args.output} -> {args.change_label}")
+        n = change_labels_in_file(args.output, args.change_label)
+        print(f"Updated {n} entries.")
+        return 0
+
+    # Need a dataset unless we're just changing labels
+    if not args.database:
+        print("Error: --database is required (unless using --change_label on an existing file).")
         return 1
 
+    dataset_name = args.database
+    print(f"Loading dataset: {dataset_name}")
+    if args.data_dir:
+        print(f"  data-dir filter: {args.data_dir}")
+    if args.subset:
+        print(f"  subset: {args.subset}")
+    if args.directory and args.data_dir and args.directory != args.data_dir:
+        print(f"Warning: --data-dir ({args.data_dir}) != --directory ({args.directory}).")
+
+    try:
+        dataset = load_dataset(
+            dataset_name,
+            name=args.subset,
+            data_dir=args.data_dir if args.data_dir else None,
+            streaming=args.streaming or True  # streaming=True ensures URLs not local tmp files
+        )
+        print("Dataset loaded.")
+        if isinstance(dataset, dict):
+            print(f"Available splits: {list(dataset.keys())}")
+    except Exception as e:
+        print(f"Error loading dataset: {e}")
+        return 1
+
+    json_data = extract_videos_from_dataset(
+        dataset=dataset,
+        dataset_name=dataset_name,
+        video_column=args.video_column,
+        label_column=args.label_column,
+        split=args.split,
+        max_items=args.max_items,
+        default_label=args.label,
+        change_label=args.change_label,
+        data_dir=args.data_dir,
+        directory=args.directory
+    )
+
+    if not json_data:
+        print("No entries extracted.")
+        return 1
+
+    with open(args.output, "w") as f:
+        json.dump(json_data, f, indent=4)
+
+    print(f"\nJSON written to {args.output} ({len(json_data)} entries)")
+    uniq = set(x["label"] for x in json_data)
+    if len(uniq) > 1:
+        print("Label distribution:")
+        for lab in sorted(uniq):
+            c = sum(1 for x in json_data if x["label"] == lab)
+            print(f"  {lab}: {c}")
+
+    return 0
+
+
 if __name__ == "__main__":
-    main() 
+    raise SystemExit(main())
